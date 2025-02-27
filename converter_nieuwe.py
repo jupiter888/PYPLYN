@@ -3,42 +3,42 @@ import os
 import dask.dataframe as dd
 import pandas as pd
 import csv
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 def detect_delimiter(filepath, sample_size=1000):
-    """Detects the delimiter of a CSV file."""
     with open(filepath, 'r', encoding='utf-8') as f:
         sample = [next(f) for _ in range(sample_size)]
     sniffer = csv.Sniffer()
     return sniffer.sniff("\n".join(sample)).delimiter
 
 def convert_csv_to_parquet(csv_path, output_dir):
-    print(f"🔍 Validating CSV before conversion: {csv_path}")
+    print(f"🔍 validating csv before conversion: {csv_path}")
 
     # detect delimiter
     delimiter = detect_delimiter(csv_path)
-    print(f"🧐 Detected delimiter: '{repr(delimiter)}'")
-
+    print(f"🧐 detected delimiter: {repr(delimiter)}")
+    
     # ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
+    # specify columns to keep and enforce dtypes
     keep_columns = [
         'gbifID', 'species', 'decimalLongitude', 'decimalLatitude',
         'countryCode', 'elevation', 'datasetKey', 'eventDate'
     ]
-
     dtype_fix = {
         'gbifID': 'object',
         'species': 'object',
-        'decimalLongitude': 'object',  # Will be converted later
-        'decimalLatitude': 'object',   # Will be converted later
+        'decimalLongitude': 'object',  # will convert later
+        'decimalLatitude': 'object',   # will convert later
         'countryCode': 'object',
-        'elevation': 'object',         # Will be converted later
+        'elevation': 'object',         # will convert later
         'datasetKey': 'object',
         'eventDate': 'object'
     }
-
+    
     try:
-        # reads CSV with detected delimiter and enforced dtypes
         ddf = dd.read_csv(
             csv_path,
             delimiter=delimiter,
@@ -47,34 +47,27 @@ def convert_csv_to_parquet(csv_path, output_dir):
             assume_missing=True
         )
     except Exception as e:
-        print(f"❌ Error reading CSV: {e}")
+        print(f"❌ error reading csv: {e}")
         sys.exit(1)
-
-    print("\n🚨 **Checking for mixed data types in columns...**")
-    problematic_values = {}
-
+    
+    # convert specific columns to numeric
     for col in ['decimalLongitude', 'decimalLatitude', 'elevation']:
-        try:
-            # convert to float, keeping track of errors
-            ddf[col] = ddf[col].apply(pd.to_numeric, errors='coerce', meta=(col, 'float64'))
-            non_numeric = ddf[col][ddf[col].isna()].compute().dropna().unique()
-            if len(non_numeric) > 0:
-                problematic_values[col] = non_numeric
-        except Exception as e:
-            print(f"⚠️ Error checking column {col}: {e}")
-
-    # log problematic values
-    if problematic_values:
-        print("\n🚨 **Problematic values detected in numeric columns:**")
-        for col, values in problematic_values.items():
-            print(f"⚠️ Column: {col} - Invalid values: {values[:5]}... (showing first 5)")
-
-    # display missing value report
+        ddf[col] = ddf[col].apply(pd.to_numeric, errors='coerce', meta=(col, 'float64'))
+    
+    # check partition consistency
+    print("\n📊 partition report:")
+    partition_info = ddf.map_partitions(lambda df: pd.DataFrame({'row_count': [len(df)]})).compute()
+    print("Row counts per partition:")
+    print(partition_info)
+    print("Dtypes:")
+    print(ddf.dtypes)
+    
+    # missing value report
     missing_report = ddf.isnull().sum().compute()
-    print("\n📉 **Missing Values Per Column Before Conversion:**")
+    print("\n📉 missing values per column before conversion:")
     print(missing_report[missing_report > 0])
-
-    # handle missing data
+    
+    # fill missing values
     ddf = ddf.fillna({
         'species': 'Unknown',
         'countryCode': 'Unknown',
@@ -83,14 +76,39 @@ def convert_csv_to_parquet(csv_path, output_dir):
         'elevation': -9999,
         'eventDate': 'Unknown'
     })
-
+    
     try:
-        # convert to Parquet format
         ddf.to_parquet(output_dir, engine='pyarrow', write_index=False)
-        print(f"✅ Conversion complete. Parquet files saved in: {output_dir}")
+        print(f"✅ conversion complete. Parquet files saved in: {output_dir}")
     except Exception as e:
-        print(f"❌ Error writing Parquet files: {e}")
+        print(f"❌ error writing Parquet files: {e}")
         sys.exit(1)
+    
+    # generate a report for each parquet file
+    print("\n📑 parquet file report:")
+    for filename in os.listdir(output_dir):
+        if filename.endswith(".parquet"):
+            file_path = os.path.join(output_dir, filename)
+            try:
+                table = pq.read_table(file_path)
+                num_rows = table.num_rows
+                schema = table.schema
+                print(f"File: {filename} - Rows: {num_rows}")
+                print("Schema:")
+                print(schema)
+            except Exception as e:
+                print(f"❌ error reading parquet file {filename}: {e}")
+    
+    # validate each parquet file by attempting to open it
+    print("\n🔎 validating each parquet file:")
+    for filename in os.listdir(output_dir):
+        if filename.endswith(".parquet"):
+            file_path = os.path.join(output_dir, filename)
+            try:
+                _ = pq.read_table(file_path)
+                print(f"File {filename} is valid.")
+            except Exception as e:
+                print(f"❌ file {filename} is invalid: {e}")
 
 if __name__ == '__main__':
     if len(sys.argv) != 3:
